@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.env
+.venv
+venv/
+env/
+*.log
+profile_output
+
+# Flutter / Dart
+welcomrea/.dart_tool/
+welcomrea/build/
+welcomrea/.flutter-plugins
+welcomrea/.flutter-plugins-dependencies
+welcomrea/android/.gradle/
+welcomrea/android/app/.cxx/
+welcomrea/android/local.properties
+welcomrea/ios/.symlinks/
+welcomrea/ios/Pods/
+welcomrea/ios/Flutter/Flutter.framework
+welcomrea/ios/Flutter/Flutter.podspec
+welcomrea/.packages
+welcomrea/pubspec.lock
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Zip
+*.zip
