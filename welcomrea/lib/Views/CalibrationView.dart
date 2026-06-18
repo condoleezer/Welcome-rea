@@ -9,12 +9,14 @@ class CalibrationView extends StatefulWidget {
   final IO.Socket socket;
   final CameraController cameraController;
   final VoidCallback onCalibrationDone;
+  final Future<CameraController> Function()? onRestartCamera;
 
   const CalibrationView({
     Key? key,
     required this.socket,
     required this.cameraController,
     required this.onCalibrationDone,
+    this.onRestartCamera,
   }) : super(key: key);
 
   @override
@@ -24,27 +26,27 @@ class CalibrationView extends StatefulWidget {
 class _CalibrationViewState extends State<CalibrationView>
     with SingleTickerProviderStateMixin {
   final List<Offset> _relativePoints = const [
-    Offset(0.1, 0.1),   // haut-gauche
-    Offset(0.5, 0.1),   // haut-centre
-    Offset(0.9, 0.1),   // haut-droite
-    Offset(0.1, 0.5),   // milieu-gauche
-    Offset(0.5, 0.5),   // centre
-    Offset(0.9, 0.5),   // milieu-droite
-    Offset(0.1, 0.9),   // bas-gauche
-    Offset(0.5, 0.9),   // bas-centre
-    Offset(0.9, 0.9),   // bas-droite
+    // Grille 3x3 = 9 points, calibration rapide
+    Offset(0.1, 0.1), Offset(0.5, 0.1), Offset(0.9, 0.1),
+    Offset(0.1, 0.5), Offset(0.5, 0.5), Offset(0.9, 0.5),
+    Offset(0.1, 0.9), Offset(0.5, 0.9), Offset(0.9, 0.9),
   ];
 
   int    _currentIndex    = 0;
   // FIX : on commence en phase "fixe" (rouge), pas en collecte
   bool   _collecting      = false;
   bool   _done            = false;
+  bool   _calibSuccess    = false;
+  int    _qualityPct      = 0;
   int    _framesCollected = 0;
-  static const int _framesPerPoint = 20;  // plus de frames = moyenne plus stable
+  static const int _framesPerPoint = 8;  // réduit pour accélérer la calibration
   Timer? _collectTimer;
   String _status = 'Regarde le point rouge et reste immobile';
 
   Uint8List? _lastFrameBytes;
+  bool _converting = false;
+  DateTime _streamRestartTime = DateTime.fromMillisecondsSinceEpoch(0);
+  late CameraController _activeController;
 
   // Animation pulse pour le point
   late AnimationController _pulseController;
@@ -53,6 +55,7 @@ class _CalibrationViewState extends State<CalibrationView>
   @override
   void initState() {
     super.initState();
+    _activeController = widget.cameraController;
 
     _pulseController = AnimationController(
       vsync: this,
@@ -70,38 +73,41 @@ class _CalibrationViewState extends State<CalibrationView>
   DateTime _lastFrameTime = DateTime.fromMillisecondsSinceEpoch(0);
 
   void _startImageStream() {
-    if (!widget.cameraController.value.isStreamingImages) {
-      widget.cameraController.startImageStream((CameraImage image) {
-        // Throttle : max 1 frame/seconde pour éviter OutOfMemoryError
+    if (!_activeController.value.isStreamingImages) {
+      _activeController.startImageStream((CameraImage image) {
+        // Throttle : max ~2 frames/seconde
         final now = DateTime.now();
-        if (now.difference(_lastFrameTime).inMilliseconds < 900) return;
-        _lastFrameTime = now;
+        if (now.difference(_lastFrameTime).inMilliseconds < 400) return;
         _convertAndBuffer(image);
       });
     }
   }
 
   void _convertAndBuffer(CameraImage image) async {
+    if (_converting) return;
+    // Ignorer les frames produites avant le dernier restart
+    if (DateTime.now().isBefore(_streamRestartTime)) return;
+    _converting = true;
     try {
-      // Utiliser directement le plan Y (luminance) sans passer par img.Image
-      // pour éviter OutOfMemoryError sur les tablettes avec peu de RAM
-      final w = image.width;
-      final h = image.height;
+      final w   = image.width;
+      final h   = image.height;
+      final bpr = image.planes[0].bytesPerRow; // IMPORTANT : tenir compte du padding
       final yPlane = image.planes[0].bytes;
 
-      // Construire une image JPEG via img en niveaux de gris de façon optimisée
       final grayscale = img.Image(width: w, height: h, numChannels: 1);
-      final pixelData = grayscale.data;
-      if (pixelData != null) {
-        int i = 0;
-        for (int y = 0; y < h; y++) {
-          for (int x = 0; x < w; x++) {
-            grayscale.setPixelR(x, y, yPlane[i++]);
-          }
+      for (int y = 0; y < h; y++) {
+        final rowOffset = y * bpr;
+        for (int x = 0; x < w; x++) {
+          grayscale.setPixelR(x, y, yPlane[rowOffset + x]);
         }
       }
       _lastFrameBytes = Uint8List.fromList(img.encodeJpg(grayscale, quality: 40));
-    } catch (_) {}
+      _lastFrameTime  = DateTime.now(); // marquer quand la frame a été produite
+    } catch (e) {
+      debugPrint('Erreur conversion frame : $e');
+    } finally {
+      _converting = false;
+    }
   }
 
   void _startCalibration() {
@@ -126,7 +132,7 @@ class _CalibrationViewState extends State<CalibrationView>
     });
 
     // Attendre que le stream soit actif ET que l'utilisateur fixe le point
-    Future.delayed(const Duration(milliseconds: 3000), () {
+    Future.delayed(const Duration(milliseconds: 1500), () {
       if (!mounted) return;
       // Vérifier que des frames arrivent bien
       if (_lastFrameBytes == null) {
@@ -156,7 +162,7 @@ class _CalibrationViewState extends State<CalibrationView>
                 'Point ${_currentIndex + 1} / ${_relativePoints.length}';
     });
 
-    _collectTimer = Timer.periodic(const Duration(milliseconds: 300), (timer) async {
+    _collectTimer = Timer.periodic(const Duration(milliseconds: 600), (timer) async {
       if (!mounted) { timer.cancel(); return; }
       if (_framesCollected >= _framesPerPoint) {
         timer.cancel();
@@ -180,42 +186,96 @@ class _CalibrationViewState extends State<CalibrationView>
       return;
     }
     widget.socket.emit('calibration_frame', bytes);
-    // FIX : on écoute une seule fois mais on comptabilise localement
-    // sans attendre la réponse pour ne pas bloquer la progression
     setState(() => _framesCollected++);
-    // On écoute quand même la réponse pour les erreurs critiques
     widget.socket.once('calibration_frame_result', (data) {
       if (!mounted) return;
-      if (data['success'] == false && data['reason'] == 'decode_error') {
-        // Frame corrompue : décrémenter
-        if (mounted) setState(() => _framesCollected = (_framesCollected - 1).clamp(0, _framesPerPoint));
+      if (data['success'] == false) {
+        final reason = data['reason'] ?? '';
+        if (reason == 'decode_error' || reason == 'frozen_frame') {
+          // Frame invalide : décrémenter pour ne pas compter cette frame
+          if (mounted) setState(() => _framesCollected = (_framesCollected - 1).clamp(0, _framesPerPoint));
+        }
       }
     });
   }
 
-  void _finishCalibration() {
+ void _finishCalibration() {
     if (!mounted) return;
     widget.socket.emit('calibration_finish');
     widget.socket.once('calibration_done', (data) {
       if (!mounted) return;
+      final bool success = data['success'] == true;
+      final int  quality = (data['quality'] ?? 0) as int;
+      final String errMsg = (data['error_message'] ?? '') as String;
+
       setState(() {
-        _done   = true;
-        _status = data['success'] == true
-            ? '✅ Calibration réussie !\n(${data['points']} frames collectées)'
-            : '⚠️ Calibration incomplète\nRelancez depuis le bouton calibration';
+        _done          = true;
+        _calibSuccess  = success;
+        _qualityPct    = quality;
+
+        if (success) {
+          String qualityLabel;
+          if (quality >= 80) {
+            qualityLabel = '🟢 Excellente ($quality%)';
+          } else if (quality >= 60) {
+            qualityLabel = '🟡 Correcte ($quality%)';
+          } else {
+            qualityLabel = '🔴 Faible ($quality%)';
+          }
+          _status = '✅ Calibration réussie !\nQualité : $qualityLabel\n(${data['points']} points collectés)';
+        } else {
+          _status = '❌ Calibration échouée\n$errMsg';
+        }
       });
-      Future.delayed(const Duration(seconds: 2), () {
-        if (mounted) widget.onCalibrationDone();
-      });
+
+      if (success && quality >= 60) {
+        // Bonne calibration → on continue automatiquement
+        Future.delayed(const Duration(seconds: 3), () {
+          if (mounted) widget.onCalibrationDone();
+        });
+      }
+      // Si échec ou qualité faible → l'utilisateur choisit via les boutons
     });
   }
 
+  void _restartCalibration() async {
+    _collectTimer?.cancel();
+    setState(() {
+      _currentIndex    = 0;
+      _collecting      = false;
+      _done            = false;
+      _calibSuccess    = false;
+      _qualityPct      = 0;
+      _framesCollected = 0;
+      _status = 'Préparation… 📷';
+      _lastFrameBytes  = null;
+    });
+    _converting = false;
+
+    // Arrêter le stream
+    if (_activeController.value.isStreamingImages) {
+      await _activeController.stopImageStream();
+    }
+
+    // Attendre que la caméra se stabilise complètement
+    await Future.delayed(const Duration(milliseconds: 1200));
+
+    // Marquer le temps de restart — ignorer les frames produites avant
+    _streamRestartTime = DateTime.now().add(const Duration(milliseconds: 800));
+
+    // Redémarrer le stream
+    _startImageStream();
+
+    // Attendre que de vraies nouvelles frames arrivent
+    await Future.delayed(const Duration(milliseconds: 2000));
+    if (mounted) _startCalibration();
+  }
   @override
   void dispose() {
     _collectTimer?.cancel();
     _pulseController.dispose();
-    if (widget.cameraController.value.isStreamingImages) {
-      widget.cameraController.stopImageStream();
+    if (_activeController.value.isStreamingImages) {
+      _activeController.stopImageStream();
     }
     super.dispose();
   }
@@ -323,23 +383,112 @@ class _CalibrationViewState extends State<CalibrationView>
               },
             ),
 
-          // Écran de succès
+          // Écran de fin
           if (_done)
             Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  const Icon(Icons.check_circle,
-                      color: Colors.green, size: 100),
+                  Icon(
+                    _calibSuccess ? Icons.check_circle : Icons.error_outline,
+                    color: _calibSuccess
+                        ? (_qualityPct >= 80 ? Colors.green : Colors.orange)
+                        : Colors.red,
+                    size: 100,
+                  ),
                   const SizedBox(height: 24),
                   Text(
                     _status,
                     style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 22,
-                        height: 1.5),
+                        color: Colors.white, fontSize: 20, height: 1.6),
                     textAlign: TextAlign.center,
                   ),
+                  const SizedBox(height: 32),
+
+                  // Barre de qualité (uniquement si succès)
+                  if (_calibSuccess) ...[
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 48),
+                      child: Column(
+                        children: [
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(6),
+                            child: LinearProgressIndicator(
+                              value: _qualityPct / 100.0,
+                              backgroundColor: Colors.grey.shade800,
+                              color: _qualityPct >= 80
+                                  ? Colors.green
+                                  : _qualityPct >= 60
+                                      ? Colors.orange
+                                      : Colors.red,
+                              minHeight: 10,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            'Qualité : $_qualityPct%',
+                            style: TextStyle(
+                              color: _qualityPct >= 80
+                                  ? Colors.green
+                                  : _qualityPct >= 60
+                                      ? Colors.orange
+                                      : Colors.red,
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 32),
+                  ],
+
+                  // Boutons d'action
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      OutlinedButton.icon(
+                        onPressed: _restartCalibration,
+                        icon: const Icon(Icons.refresh, color: Colors.white),
+                        label: const Text('Recommencer',
+                            style: TextStyle(color: Colors.white)),
+                        style: OutlinedButton.styleFrom(
+                          side: const BorderSide(color: Colors.white54),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 20, vertical: 14),
+                        ),
+                      ),
+                      if (_calibSuccess) ...[
+                        const SizedBox(width: 16),
+                        ElevatedButton.icon(
+                          onPressed: widget.onCalibrationDone,
+                          icon: const Icon(Icons.arrow_forward),
+                          label: const Text('Continuer'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: _qualityPct >= 60
+                                ? Colors.green
+                                : Colors.orange,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 20, vertical: 14),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+
+                  // Avertissement qualité faible
+                  if (_calibSuccess && _qualityPct < 60) ...[
+                    const SizedBox(height: 16),
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 32),
+                      child: Text(
+                        '⚠️ Qualité faible — recommencez en gardant la tête immobile',
+                        style: TextStyle(color: Colors.orange, fontSize: 13),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),

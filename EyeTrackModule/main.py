@@ -28,19 +28,23 @@ calibration_points   = []
 calibration_matrix   = None
 current_calib_screen = None
 
+# Paramètres de normalisation iris (calculés à la calibration, utilisés à l'inférence)
+_src_min   = None
+_src_range = None
+
 # Rotation fixée après calibration (on ne change plus pendant le tracking)
 _fixed_rotation = None
 _rotation_locked = False
 
 # Lissage exponentiel du gaze
-SMOOTH_ALPHA = 0.7
+SMOOTH_ALPHA = 0.3   # plus bas = plus lisse/stable (était 0.4)
 _gaze_smooth_x = None
 _gaze_smooth_y = None
 
 # Historique court pour filtrer les pics aberrants
 _iris_history = []
 HISTORY_SIZE  = 5       # nb de frames gardées
-MAX_JUMP      = 0.08    # saut max autorisé entre frames (en coords iris_rel)
+MAX_JUMP      = 0.12    # relevé pour ne pas rejeter les vrais mouvements (était 0.08)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -88,8 +92,8 @@ def unconvert_coords(ix, iy, rot):
 def get_iris(frame, use_rotation):
     """
     Détecte les iris avec une rotation FIXE.
-    use_rotation : constante OpenCV (ou None).
-    Retourne (ix, iy) normalisés [0-1] dans l'espace frame originale, ou None.
+    Utilise les coins des yeux comme référence (plus sensible que la bounding box du visage).
+    Retourne (ix, iy) normalisés [0-1], ou None.
     """
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     rotated = apply_rotation(rgb, use_rotation)
@@ -100,28 +104,41 @@ def get_iris(frame, use_rotation):
 
     lm = np.array([(l.x, l.y) for l in result.multi_face_landmarks[0].landmark])
 
-    # Bounding box du visage
-    x_min, x_max = lm[:, 0].min(), lm[:, 0].max()
-    y_min, y_max = lm[:, 1].min(), lm[:, 1].max()
-    face_w = x_max - x_min
-    face_h = y_max - y_min
-
+    # Iris centers
     left_iris  = lm[[474, 475, 476, 477]].mean(axis=0)
     right_iris = lm[[469, 470, 471, 472]].mean(axis=0)
     iris_center = (left_iris + right_iris) / 2.0
 
-    # FIX CLEF : coords iris RELATIVES au visage (0=bord gauche, 1=bord droit)
-    # Ça neutralise les mouvements de tête et ne garde que le mouvement des yeux
-    if face_w > 0.01 and face_h > 0.01:
-        ix_rel = (iris_center[0] - x_min) / face_w
-        iy_rel = (iris_center[1] - y_min) / face_h
-    else:
-        ix_rel = iris_center[0]
-        iy_rel = iris_center[1]
+    # Coins des yeux comme référence
+    # Œil gauche  : coin externe=33,  coin interne=133
+    # Œil droit   : coin externe=362, coin interne=263
+    left_outer  = lm[33]
+    left_inner  = lm[133]
+    right_inner = lm[362]
+    right_outer = lm[263]
+
+    # Largeur totale des deux yeux (coin externe gauche → coin externe droit)
+    eye_x_min = left_outer[0]
+    eye_x_max = right_outer[0]
+    eye_width = eye_x_max - eye_x_min
+
+    # Hauteur : utiliser la distance iris → paupière supérieure uniquement
+    # (plus stable que haut/bas car la paupière inf bouge avec l'iris)
+    # Paupière supérieure : 159 (gauche), 386 (droit)
+    # Sourcil bas : 70 (gauche), 300 (droit) — point fixe au-dessus de l'œil
+    top_ref    = (lm[70][1]  + lm[300][1])  / 2.0   # sourcil bas = référence fixe
+    bottom_ref = (lm[145][1] + lm[374][1])  / 2.0   # paupière inf = référence basse
+    eye_height = bottom_ref - top_ref
+
+    if eye_width < 0.01 or abs(eye_height) < 0.001:
+        return None
+
+    # Position iris relative aux coins des yeux → beaucoup plus sensible
+    ix_rel = (iris_center[0] - eye_x_min) / eye_width
+    iy_rel = (iris_center[1] - top_ref)   / eye_height
 
     logger.info(f"  iris_rel=({ix_rel:.3f},{iy_rel:.3f})")
 
-    # Appliquer la correction de rotation sur les coords relatives
     ix_rel, iy_rel = unconvert_coords(float(ix_rel), float(iy_rel), use_rotation)
     return float(ix_rel), float(iy_rel)
 
@@ -151,7 +168,7 @@ def find_best_rotation(frame):
 def compute_calibration_matrix():
     global calibration_matrix
     if len(calibration_points) < 4:
-        return False
+        return False, "Pas assez de points"
 
     from collections import defaultdict
     groups = defaultdict(list)
@@ -159,13 +176,12 @@ def compute_calibration_matrix():
         groups[(sx, sy)].append((ix, iy))
 
     if len(groups) < 4:
-        logger.warning(f"Seulement {len(groups)} points uniques, calibration insuffisante")
-        return False
+        return False, f"Seulement {len(groups)} points uniques"
 
     src, dst = [], []
     for (sx, sy), pts in groups.items():
-        avg_ix = np.mean([p[0] for p in pts])
-        avg_iy = np.mean([p[1] for p in pts])
+        avg_ix = float(np.median([p[0] for p in pts]))
+        avg_iy = float(np.median([p[1] for p in pts]))
         src.append([avg_ix, avg_iy])
         dst.append([sx / screen_width, sy / screen_height])
 
@@ -174,25 +190,64 @@ def compute_calibration_matrix():
 
     src_var = src.var(axis=0)
     logger.info(f"Variance iris : x={src_var[0]:.6f}, y={src_var[1]:.6f}")
-    if src_var[0] < 1e-6 or src_var[1] < 1e-6:
-        logger.error("Variance iris trop faible → calibration invalide")
-        return False
 
-    # Régression linéaire avec centrage des features pour plus de stabilité
-    ones  = np.ones((len(src), 1), dtype=np.float64)
-    src_h = np.hstack([src, ones])   # [ix, iy, 1]
+    MIN_VAR_X = 5e-6
+    MIN_VAR_Y = 2e-6
+    if src_var[0] < MIN_VAR_X:
+        msg = f"Variance X trop faible ({src_var[0]:.6f}) — bougez plus les yeux horizontalement"
+        logger.error(msg)
+        return False, msg
+    if src_var[1] < MIN_VAR_Y:
+        msg = f"Variance Y trop faible ({src_var[1]:.6f}) — bougez plus les yeux verticalement"
+        logger.error(msg)
+        return False, msg
+
+    # Normaliser src vers [0-1] avant la régression pour éviter des coefficients explosifs
+    src_min   = src.min(axis=0)
+    src_max   = src.max(axis=0)
+    src_range = src_max - src_min
+    src_range[src_range < 1e-6] = 1.0
+    src_norm  = (src - src_min) / src_range
+
+    ones  = np.ones((len(src_norm), 1), dtype=np.float64)
+    src_h = np.hstack([src_norm, ones])
     M, residuals, _, _ = np.linalg.lstsq(src_h, dst, rcond=None)
+
+    # Validation qualité : erreur de prédiction sur les points de calibration
+    pred       = src_h @ M
+    errors     = np.abs(pred - dst)
+    mean_error = errors.mean()
+    max_error  = errors.max()
+    logger.info(f"Erreur régression — moyenne={mean_error:.3f}, max={max_error:.3f}")
+
+    if mean_error > 0.25:
+        msg = f"Calibration imprécise (erreur={mean_error:.2f}) — recommencez en gardant la tête immobile"
+        logger.error(msg)
+        return False, msg
+
+    global _src_min, _src_range
+    _src_min   = src_min
+    _src_range = src_range
     calibration_matrix = M
-    logger.info(f"Calibration linéaire OK — {len(groups)} points, résidus={residuals}")
+
+    quality_score = float(np.clip(mean_error / 0.25, 0.0, 1.0))
+    quality_pct   = int((1.0 - quality_score) * 100)
+
+    logger.info(f"Calibration OK — {len(groups)} pts | qualité={quality_pct}% | erreur moy={mean_error:.3f}")
+    logger.info(f"src_min={src_min}, src_range={src_range}")
     logger.info(f"Matrice:\n{M}")
-    return True
+    return True, quality_pct
 
 
 def iris_to_normalized(ix, iy):
     """Retourne (nx, ny) normalisés [0-1] pour Flutter."""
     if calibration_matrix is not None:
-        v   = np.array([ix, iy, 1.0], dtype=np.float64)
-        res = v @ calibration_matrix
+        v = np.array([ix, iy], dtype=np.float64)
+        if _src_min is not None and _src_range is not None:
+            v = (v - _src_min) / _src_range
+        v_h = np.array([v[0], v[1], 1.0], dtype=np.float64)
+        res = v_h @ calibration_matrix
+        # Clip strict à l'écran
         nx  = float(np.clip(res[0], 0.0, 1.0))
         ny  = float(np.clip(res[1], 0.0, 1.0))
         return nx, ny
@@ -236,15 +291,17 @@ def on_screen_size(data):
 @socketio.on('calibration_start')
 def on_calibration_start():
     global calibration_points, calibration_matrix, current_calib_screen
-    global _fixed_rotation, _rotation_locked
+    global _fixed_rotation, _rotation_locked, _src_min, _src_range
+    global _gaze_smooth_x, _gaze_smooth_y
     calibration_points   = []
     calibration_matrix   = None
     current_calib_screen = None
     _rotation_locked     = False
+    _src_min             = None
+    _src_range           = None
+    _gaze_smooth_x       = None
+    _gaze_smooth_y       = None
     _iris_history.clear()
-    _gaze_smooth_x = None
-    _gaze_smooth_y = None
-    # Réinitialiser la rotation selon l'orientation capteur connue
     _fixed_rotation = rotation_for_orientation(sensor_orientation)
     logger.info(f"Calibration démarrée | rotation initiale={_fixed_rotation}")
     emit('calibration_ready')
@@ -272,9 +329,7 @@ def on_calibration_frame(data):
     # Première frame de calibration : trouver et verrouiller la rotation
     if not _rotation_locked:
         found = find_best_rotation(frame)
-
-        # Verrouiller quelle que soit la valeur (None = pas de rotation = valide)
-        _fixed_rotation  = found  # peut être None, c'est OK
+        _fixed_rotation  = found
         _rotation_locked = True
         logger.info(f"Rotation verrouillée : {_fixed_rotation}")
 
@@ -284,6 +339,24 @@ def on_calibration_frame(data):
         return
 
     ix, iy = iris
+
+    # Rejeter les valeurs par défaut de MediaPipe (pas de détection réelle)
+    if abs(ix - 0.5) < 0.001 and abs(iy - 0.3333) < 0.001:
+        logger.warning(f"Frame rejetée — valeur par défaut détectée ({ix:.4f},{iy:.4f})")
+        emit('calibration_frame_result', {'success': False, 'reason': 'default_value'})
+        return
+
+    # Ignorer silencieusement les frames figées (caméra pas encore stabilisée)
+    # sans bloquer la calibration — on attend juste la prochaine frame
+    if len(calibration_points) >= 6:
+        last6 = calibration_points[-6:]
+        xs = [p[2] for p in last6]
+        ys = [p[3] for p in last6]
+        if max(xs) - min(xs) < 0.001 and max(ys) - min(ys) < 0.001:
+            logger.warning(f"Frame ignorée — caméra figée ({ix:.4f},{iy:.4f})")
+            emit('calibration_frame_result', {'success': False, 'reason': 'frozen_frame'})
+            return
+
     sx, sy = current_calib_screen
     calibration_points.append((sx, sy, ix, iy))
     logger.info(f"Calib : écran=({sx},{sy}) iris=({ix:.4f},{iy:.4f})")
@@ -291,13 +364,15 @@ def on_calibration_frame(data):
 
 @socketio.on('calibration_finish')
 def on_calibration_finish():
-    ok = compute_calibration_matrix()
+    ok, info = compute_calibration_matrix()
     emit('calibration_done', {
-        'success': ok,
-        'points':  len(calibration_points),
+        'success':       ok,
+        'points':        len(calibration_points),
+        'quality':       info if ok else 0,
+        'error_message': "" if ok else str(info),
     })
     if not ok:
-        logger.error("Calibration échouée — relancer la calibration")
+        logger.error(f"Calibration échouée : {info}")
 
 
 # ── Tracking ──────────────────────────────────────────────────────────────────
@@ -347,6 +422,16 @@ def on_handle_frame(data):
         if _gaze_smooth_x is None:
             _gaze_smooth_x, _gaze_smooth_y = nx, ny
         else:
+            # Filtre de stabilité : micro-mouvements ignorés → curseur reste en place
+            gaze_move = abs(nx - _gaze_smooth_x) + abs(ny - _gaze_smooth_y)
+            if gaze_move < 0.06:  # seuil relevé pour plus de stabilité (était 0.04)
+                emit('gaze_data', {
+                    'gaze_left_x':  _gaze_smooth_x,
+                    'gaze_left_y':  _gaze_smooth_y,
+                    'gaze_right_x': _gaze_smooth_x,
+                    'gaze_right_y': _gaze_smooth_y,
+                })
+                return
             _gaze_smooth_x = SMOOTH_ALPHA * nx + (1 - SMOOTH_ALPHA) * _gaze_smooth_x
             _gaze_smooth_y = SMOOTH_ALPHA * ny + (1 - SMOOTH_ALPHA) * _gaze_smooth_y
 

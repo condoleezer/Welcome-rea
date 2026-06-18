@@ -8,6 +8,7 @@ import 'package:image/image.dart' as img;
 import 'package:camera/camera.dart';
 import 'dart:async';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'CalibrationView.dart';
 
 class PainView extends StatefulWidget {
@@ -21,30 +22,33 @@ class _PainViewState extends State<PainView> {
   IO.Socket? socket;
   bool _isTracking = false;
 
-  // Coordonnées normalisées [0-1] reçues du serveur
   double _gazeNormX = 0.0;
   double _gazeNormY = 0.0;
+
+  // Stabilité du curseur : encadré quand le regard reste au même endroit
+  bool   _gazeStable    = false;
+  double _stableX       = 0.0;
+  double _stableY       = 0.0;
+  int    _stableFrames  = 0;
+  static const int _stableThreshold = 4; // nb de frames consécutives pour considérer stable
+  static const double _stableRadius = 60.0; // rayon de stabilité en pixels
 
   CameraController? _controller;
   DateTime lastErrorTime = DateTime.now();
   Timer? _frameTimer;
 
-  double screenWidth = 0.0;
+  double screenWidth  = 0.0;
   double screenHeight = 0.0;
 
-  // Coordonnées en pixels écran (pour affichage et hit-test)
   double averageX = 0.0;
   double averageY = 0.0;
 
-  // Orientation du capteur caméra (récupérée depuis CameraDescription)
-  int _sensorOrientation = 0;
+  int  _sensorOrientation = 0;
+  bool _screenSizeSent    = false;
 
-  // FIX : flag pour envoyer screen_size seulement quand socket ET dimensions sont prêts
-  bool _screenSizeSent = false;
-
-  final List<GlobalKey<EmptyWidgetState>> _emptyWidgetKeys = [];
+  final List<GlobalKey<EmptyWidgetState>>  _emptyWidgetKeys = [];
   final List<GlobalKey<_ImageWidgetState>> _imageWidgetKeys = [];
-  Timer? _gazeTimer;
+  Timer?  _gazeTimer;
   GlobalKey<State<StatefulWidget>>? _hoveredWidgetKey;
 
   @override
@@ -59,21 +63,17 @@ class _PainViewState extends State<PainView> {
         screenWidth  = MediaQuery.of(context).size.width;
         screenHeight = MediaQuery.of(context).size.height;
       });
-      // Essayer d'envoyer, mais le socket n'est peut-être pas prêt
       _trySendScreenSize();
     });
   }
 
-  // FIX : envoie screen_size + sensor_orientation de façon sécurisée
   void _trySendScreenSize() {
     if (_screenSizeSent) return;
     if (socket == null || !socket!.connected) return;
     if (screenWidth == 0 || screenHeight == 0) return;
-
     socket!.emit('screen_size', {
-      'width':  screenWidth,
-      'height': screenHeight,
-      // FIX : on envoie l'orientation capteur pour que Python corrige la rotation
+      'width':              screenWidth,
+      'height':             screenHeight,
       'sensor_orientation': _sensorOrientation,
     });
     _screenSizeSent = true;
@@ -89,24 +89,33 @@ class _PainViewState extends State<PainView> {
       orElse: () => cameras[0],
     );
 
-    // FIX : récupérer l'orientation du capteur pour la transmettre au serveur
     _sensorOrientation = frontCamera.sensorOrientation;
     print('Caméra : ${frontCamera.name} | sensorOrientation = $_sensorOrientation°');
 
     _controller = CameraController(
       frontCamera,
-      ResolutionPreset.medium,  // Meilleure précision iris
+      ResolutionPreset.medium,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
 
     try {
       await _controller!.initialize();
-      // Re-envoyer screen_size maintenant qu'on connaît l'orientation capteur
       _screenSizeSent = false;
       _trySendScreenSize();
     } catch (e) {
       print("Erreur init caméra : $e");
     }
+  }
+
+  Future<CameraController> _reinitCamera() async {
+    if (_controller != null && _controller!.value.isStreamingImages) {
+      await _controller!.stopImageStream();
+    }
+    if (_controller != null) {
+      await _controller!.dispose();
+    }
+    await _initializeCamera();
+    return _controller!;
   }
 
   Future<void> _initializeEyeTracking() async {
@@ -119,11 +128,11 @@ class _PainViewState extends State<PainView> {
   }
 
   Future<void> _connectToServer() async {
-    socket = IO.io('http://10.77.248.16:5000', <String, dynamic>{
-      'transports':          ['websocket'],
-      'autoConnect':         true,
-      'reconnection':        true,
-      'reconnectionDelay':   1000,
+    socket = IO.io('http://10.77.248.33:5000', <String, dynamic>{
+      'transports':           ['websocket'],
+      'autoConnect':          true,
+      'reconnection':         true,
+      'reconnectionDelay':    1000,
       'reconnectionAttempts': 999,
     });
 
@@ -131,17 +140,15 @@ class _PainViewState extends State<PainView> {
 
     socket!.on('connect', (_) {
       print('Connecté au serveur');
-      // FIX : envoyer screen_size dès la connexion établie
       _screenSizeSent = false;
       _trySendScreenSize();
-
       if (_isTracking && (_controller == null || !_controller!.value.isInitialized)) {
         _initializeEyeTracking();
       }
     });
 
-    socket!.on('gaze_data',  (data) => _handleGazeData(data));
-    socket!.on('error',      (data) {
+    socket!.on('gaze_data', (data) => _handleGazeData(data));
+    socket!.on('error', (data) {
       final msg = data['message'] ?? '';
       if (msg == 'Failed to detect eyes') _handleEyeDetectionError();
     });
@@ -186,21 +193,24 @@ class _PainViewState extends State<PainView> {
 
     if (!_controller!.value.isStreamingImages) {
       _controller!.startImageStream((CameraImage image) {
+        // Marquer le tracking comme actif dès la première vraie frame
+        if (!_isTracking) {
+          setState(() => _isTracking = true);
+        }
         if (_frameTimer == null || !_frameTimer!.isActive) {
           _sendFrameToServer(image);
           _frameTimer = Timer(const Duration(milliseconds: 500), () {});
         }
       });
+    } else {
+      setState(() => _isTracking = true);
     }
-
-    setState(() => _isTracking = true);
   }
 
   void _simulateGazeData() {
     Timer.periodic(const Duration(seconds: 2), (timer) {
       if (!_isTracking) { timer.cancel(); return; }
       final rng = Random();
-      // Simulation avec coordonnées normalisées [0-1]
       _handleGazeData({
         'gaze_left_x':  rng.nextDouble(),
         'gaze_left_y':  rng.nextDouble(),
@@ -210,11 +220,6 @@ class _PainViewState extends State<PainView> {
     });
   }
 
-  // Lissage Flutter côté affichage
-  static const double _flutterAlpha = 0.6;  // plus réactif
-
-  // FIX PRINCIPAL : le serveur envoie du normalisé [0-1]
-  // On convertit en pixels écran ici
   void _handleGazeData(dynamic data) {
     if (!mounted) return;
 
@@ -226,21 +231,28 @@ class _PainViewState extends State<PainView> {
     final double normAvgX = (normLeftX + normRightX) / 2.0;
     final double normAvgY = (normLeftY + normRightY) / 2.0;
 
-    // Cible en pixels écran
     final double targetX = normAvgX * screenWidth;
     final double targetY = normAvgY * screenHeight;
 
     setState(() {
       _gazeNormX = normAvgX;
       _gazeNormY = normAvgY;
+      averageX   = targetX;
+      averageY   = targetY;
 
-      // Lissage exponentiel côté Flutter pour un curseur plus fluide
-      if (averageX == 0.0 && averageY == 0.0) {
-        averageX = targetX;
-        averageY = targetY;
+      // Détection de stabilité : curseur dans un rayon de _stableRadius pendant _stableThreshold frames
+      final double dist = ((targetX - _stableX) * (targetX - _stableX) +
+                           (targetY - _stableY) * (targetY - _stableY));
+      if (dist < _stableRadius * _stableRadius) {
+        _stableFrames++;
+        if (_stableFrames >= _stableThreshold) {
+          _gazeStable = true;
+        }
       } else {
-        averageX = _flutterAlpha * targetX + (1 - _flutterAlpha) * averageX;
-        averageY = _flutterAlpha * targetY + (1 - _flutterAlpha) * averageY;
+        _stableFrames = 0;
+        _stableX      = targetX;
+        _stableY      = targetY;
+        _gazeStable   = false;
       }
 
       _checkGazeOnWidgets(averageX, averageY);
@@ -250,15 +262,17 @@ class _PainViewState extends State<PainView> {
           '→ écran=(${averageX.toInt()}, ${averageY.toInt()})');
   }
 
-  // Tolérance hit-test : agrandit virtuellement chaque widget de N pixels
-  static const double _hitTolerance = 40.0;
+  // Distance max pour considérer un widget comme ciblé
+  static const double _maxGazeDistance = 150.0;
 
   void _checkGazeOnWidgets(double x, double y) {
     final List<GlobalKey<State<StatefulWidget>>> allKeys = [
       ..._emptyWidgetKeys.cast<GlobalKey<State<StatefulWidget>>>(),
       ..._imageWidgetKeys.cast<GlobalKey<State<StatefulWidget>>>(),
     ];
-    bool found = false;
+
+    GlobalKey<State<StatefulWidget>>? closestKey;
+    double closestDist = _maxGazeDistance;
 
     for (final key in allKeys) {
       final ctx = key.currentContext;
@@ -267,23 +281,38 @@ class _PainViewState extends State<PainView> {
       final pos = box.localToGlobal(Offset.zero);
       final sz  = box.size;
 
-      if (x >= pos.dx - _hitTolerance &&
-          x <= pos.dx + sz.width  + _hitTolerance &&
-          y >= pos.dy - _hitTolerance &&
-          y <= pos.dy + sz.height + _hitTolerance) {
-        if (_hoveredWidgetKey != key) _startGazeTimer(key);
-        found = true;
-        break;
+      final cx   = pos.dx + sz.width  / 2;
+      final cy   = pos.dy + sz.height / 2;
+      final dist = (x - cx).abs() + (y - cy).abs();
+
+      if (dist < closestDist) {
+        closestDist = dist;
+        closestKey  = key;
       }
     }
 
-    if (!found) _resetGazeTimer();
+    // Mettre à jour le hover visuel sur tous les widgets
+    for (final key in _emptyWidgetKeys) {
+      final st = key.currentState;
+      if (st == null) continue;
+      if (key == closestKey) {
+        st.hover();
+      } else {
+        st.unhover();
+      }
+    }
+
+    if (closestKey != null) {
+      if (_hoveredWidgetKey != closestKey) _startGazeTimer(closestKey);
+    } else {
+      _resetGazeTimer();
+    }
   }
 
   void _startGazeTimer(GlobalKey<State<StatefulWidget>> key) {
     _resetGazeTimer();
     setState(() => _hoveredWidgetKey = key);
-    _gazeTimer = Timer(const Duration(seconds: 3), () {
+    _gazeTimer = Timer(const Duration(seconds: 15), () {
       final st = key.currentState;
       if (st is _ImageWidgetState)  st.toggleSelection();
       else if (st is EmptyWidgetState) st.toggleSelection();
@@ -301,7 +330,6 @@ class _PainViewState extends State<PainView> {
     try {
       final bytes = await _convertImageToBytes(image);
       print('Frame envoyée : ${bytes.length} bytes');
-      // On envoie les bytes directement (decode_frame côté Python accepte ça)
       socket!.emit('handle_frame', bytes);
     } catch (e) {
       print('Erreur envoi frame : $e');
@@ -309,8 +337,8 @@ class _PainViewState extends State<PainView> {
   }
 
   Future<Uint8List> _convertImageToBytes(CameraImage image) async {
-    final w = image.width;
-    final h = image.height;
+    final w      = image.width;
+    final h      = image.height;
     final yPlane = image.planes[0].bytes;
     final bpr    = image.planes[0].bytesPerRow;
     final grayscale = img.Image(width: w, height: h, numChannels: 1);
@@ -323,14 +351,13 @@ class _PainViewState extends State<PainView> {
     return Uint8List.fromList(img.encodeJpg(grayscale, quality: 40));
   }
 
-  
   void _stopEyeTracking() {
     setState(() {
       _isTracking = false;
-      averageX = 0.0;
-      averageY = 0.0;
-      _gazeNormX = 0.0;
-      _gazeNormY = 0.0;
+      averageX    = 0.0;
+      averageY    = 0.0;
+      _gazeNormX  = 0.0;
+      _gazeNormY  = 0.0;
     });
     _stopCamera();
   }
@@ -382,16 +409,31 @@ class _PainViewState extends State<PainView> {
             icon: const Icon(Icons.tune),
             tooltip: 'Calibration',
             onPressed: () async {
+              await WakelockPlus.enable();
               await _initializeCamera();
-              if (_controller == null || !_controller!.value.isInitialized) return;
-              if (!mounted) return;
+              if (_controller == null || !_controller!.value.isInitialized) {
+                await WakelockPlus.disable();
+                return;
+              }
+              if (!mounted) {
+                await WakelockPlus.disable();
+                return;
+              }
               await Navigator.push(context, MaterialPageRoute(
                 builder: (_) => CalibrationView(
                   socket: socket!,
                   cameraController: _controller!,
                   onCalibrationDone: () => Navigator.pop(context),
+                  onRestartCamera: _reinitCamera,
                 ),
               ));
+              await WakelockPlus.disable();
+              // Toujours réinitialiser la caméra après calibration
+              await _stopCamera();
+              await _initializeCamera();
+              if (mounted && _isTracking) {
+                _startCapturingAndSending();
+              }
             },
           ),
           IconButton(
@@ -417,13 +459,15 @@ class _PainViewState extends State<PainView> {
           ),
         ],
       ),
-      body: Center(
-        child: SizedBox(
-          width: size.width * 0.9,
-          height: size.height * 0.9,
-          child: Stack(
-            children: [
-              ListView(
+
+      // Stack racine plein écran pour que le curseur soit en coordonnées écran complètes
+      body: Stack(
+        children: [
+          Center(
+            child: SizedBox(
+              width:  size.width  * 0.9,
+              height: size.height * 0.9,
+              child: ListView(
                 children: [
                   _sectionHeader('Avez-vous mal?'),
                   Padding(
@@ -578,18 +622,33 @@ class _PainViewState extends State<PainView> {
                   const SizedBox(height: 20),
                 ],
               ),
+            ),
+          ),
 
-              // ── Curseur de regard ──────────────────────────────────────────
-              // FIX : averageX/Y sont déjà en pixels écran, on les utilise directement
-              if (_isTracking)
-                Positioned(
-                  left: averageX - 25,
-                  top:  averageY - 25,
-                  child: IgnorePointer(
-                    child: Container(
+          // Curseur dans le Stack racine = coordonnées écran complètes
+          if (_isTracking)
+            Positioned(
+              left: averageX - 25,
+              top:  averageY - 25,
+              child: IgnorePointer(
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    // Encadré de stabilité
+                    if (_gazeStable)
+                      Container(
+                        width: 80, height: 80,
+                        decoration: BoxDecoration(
+                          border: Border.all(color: Colors.greenAccent, width: 2.5),
+                          borderRadius: BorderRadius.circular(8),
+                          color: Colors.greenAccent.withOpacity(0.08),
+                        ),
+                      ),
+                    // Curseur
+                    Container(
                       width: 50, height: 50,
                       decoration: BoxDecoration(
-                        color: Colors.red.withOpacity(0.6),
+                        color: (_gazeStable ? Colors.green : Colors.red).withOpacity(0.6),
                         shape: BoxShape.circle,
                         border: Border.all(color: Colors.white, width: 2),
                       ),
@@ -597,36 +656,35 @@ class _PainViewState extends State<PainView> {
                         child: Icon(Icons.remove_red_eye, color: Colors.white, size: 20),
                       ),
                     ),
-                  ),
-                ),
-
-              // ── Badge de statut ────────────────────────────────────────────
-              Positioned(
-                bottom: 8, left: 8,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: (_isTracking ? Colors.green : Colors.grey).withOpacity(0.85),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Row(mainAxisSize: MainAxisSize.min, children: [
-                    Icon(
-                      _isTracking ? Icons.fiber_manual_record : Icons.stop_circle,
-                      color: Colors.white, size: 12,
-                    ),
-                    const SizedBox(width: 4),
-                    Text(
-                      _isTracking
-                          ? 'Tracking (${averageX.toInt()}, ${averageY.toInt()})  norm=(${_gazeNormX.toStringAsFixed(2)}, ${_gazeNormY.toStringAsFixed(2)})'
-                          : 'Tracking inactif',
-                      style: const TextStyle(color: Colors.white, fontSize: 11),
-                    ),
-                  ]),
+                  ],
                 ),
               ),
-            ],
+            ),
+
+          Positioned(
+            bottom: 8, left: 8,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: (_isTracking ? Colors.green : Colors.grey).withOpacity(0.85),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(
+                  _isTracking ? Icons.fiber_manual_record : Icons.stop_circle,
+                  color: Colors.white, size: 12,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  _isTracking
+                      ? 'Tracking (${averageX.toInt()}, ${averageY.toInt()})  norm=(${_gazeNormX.toStringAsFixed(2)}, ${_gazeNormY.toStringAsFixed(2)})'
+                      : 'Tracking inactif',
+                  style: const TextStyle(color: Colors.white, fontSize: 11),
+                ),
+              ]),
+            ),
           ),
-        ),
+        ],
       ),
     );
   }
@@ -640,8 +698,6 @@ class _PainViewState extends State<PainView> {
     ),
   );
 }
-
-// ── ImageWidget ────────────────────────────────────────────────────────────────
 
 class ImageWidget extends StatefulWidget {
   final String imagePath;
